@@ -29,6 +29,8 @@ import (
 	"sigs.k8s.io/kind/pkg/cluster/nodes"
 	"sigs.k8s.io/kind/pkg/errors"
 	"sigs.k8s.io/kind/pkg/exec"
+
+	"sigs.k8s.io/kind/pkg/internal/imagearchive"
 )
 
 // KubeVersion returns the Kubernetes version installed on the node
@@ -83,11 +85,72 @@ func LoadImageArchive(n nodes.Node, image io.Reader) error {
 	if err != nil {
 		return err
 	}
-	cmd := n.Command("ctr", "--namespace=k8s.io", "images", "import", "--all-platforms", "--digests", "--snapshotter="+snapshotter, "-").SetStdin(image)
-	if err := cmd.Run(); err != nil {
+
+	// `docker save` against a containerd backed image store writes the whole
+	// image index, including platforms that were never pulled locally, so
+	// importing every platform fails on content that is not in the archive.
+	// When we can re-read the archive, import only the platforms it holds.
+	// https://github.com/kubernetes-sigs/kind/issues/3795
+	if seeker, ok := image.(io.ReadSeeker); ok {
+		platforms, err := completePlatforms(seeker)
+		if err != nil {
+			return err
+		}
+		if len(platforms) > 0 {
+			for _, platform := range platforms {
+				if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+					return errors.Wrap(err, "failed to rewind image archive")
+				}
+				if err := importArchive(n, seeker, snapshotter, platform); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
+
+	return importArchive(n, image, snapshotter, "")
+}
+
+// importArchive imports an image archive on the node, for platform, or for all
+// platforms when platform is empty
+func importArchive(n nodes.Node, image io.Reader, snapshotter, platform string) error {
+	args := []string{"--namespace=k8s.io", "images", "import", "--digests", "--snapshotter=" + snapshotter}
+	if platform == "" {
+		args = append(args, "--all-platforms")
+	} else {
+		// NOTE: ctr takes a single platform, so multi platform archives are
+		// imported once per platform
+		args = append(args, "--platform="+platform)
+	}
+	args = append(args, "-")
+	if err := n.Command("ctr", args...).SetStdin(image).Run(); err != nil {
 		return errors.Wrap(err, "failed to load image")
 	}
 	return nil
+}
+
+// completePlatforms returns the platforms to import an archive one at a time,
+// or nil if the archive can be imported for all platforms at once
+func completePlatforms(image io.ReadSeeker) ([]string, error) {
+	if _, err := image.Seek(0, io.SeekStart); err != nil {
+		return nil, errors.Wrap(err, "failed to rewind image archive")
+	}
+	content, inspectErr := imagearchive.Inspect(image)
+	if _, err := image.Seek(0, io.SeekStart); err != nil {
+		return nil, errors.Wrap(err, "failed to rewind image archive")
+	}
+	// an archive we failed to make sense of is still worth handing to containerd
+	if inspectErr != nil || content == nil || content.AllPresent {
+		return nil, nil
+	}
+	if len(content.Complete) == 0 {
+		return nil, errors.Errorf(
+			"image archive does not contain the content for any of its platforms (%s)",
+			strings.Join(content.Missing, ", "),
+		)
+	}
+	return content.Complete, nil
 }
 
 func getSnapshotter(n nodes.Node) (string, error) {
